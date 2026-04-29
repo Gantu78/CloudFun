@@ -53,7 +53,6 @@ exports.onLikeCreated = onDocumentCreated(
 
         const [reviewSnap] = await Promise.all([
             reviewRef.get(),
-            reviewRef.update({ likesCount: FieldValue.increment(1) }),
         ]);
 
         if (!reviewSnap.exists) {
@@ -94,16 +93,6 @@ exports.onLikeCreated = onDocumentCreated(
     }
 );
 
-exports.onLikeRemoved = onDocumentDeleted(
-    "reviews/{reviewId}/likes/{likeId}",
-    async (event) => {
-        const reviewId = event.params.reviewId;
-        await db.collection("reviews").doc(reviewId).update({
-            likesCount: FieldValue.increment(-1),
-        });
-        logger.log("likesCount decrementado en review:", reviewId);
-    }
-);
 
 exports.updateProfessorInfoInReviews = onDocumentUpdated(
     "professors/{professorId}",
