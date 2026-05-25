@@ -67,3 +67,9 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# Claude Code
+CLAUDE.md
+.claude/settings.json
+
+
