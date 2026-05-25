@@ -1,7 +1,9 @@
 const {
     onDocumentUpdated,
     onDocumentCreated,
+    onDocumentDeleted,
 } = require('firebase-functions/v2/firestore');
+const { getStorage } = require('firebase-admin/storage');
 
 const admin = require('firebase-admin');
 const logger = require('firebase-functions/logger');
@@ -303,5 +305,78 @@ exports.onFollowCreated = onDocumentCreated(
             userId,
             notifData
         );
+    }
+);
+
+exports.onUserAccountDeleted = onDocumentDeleted(
+    "users/{userId}",
+    async (event) => {
+        const userId = event.params.userId;
+        const CHUNK = 200;
+
+        logger.log("Iniciando limpieza de cuenta:", userId);
+
+        // 1. Delete profile image from Storage
+        try {
+            await getStorage().bucket().file(`profileImages/${userId}.jpg`).delete();
+        } catch (e) {
+            logger.warn("Sin imagen de perfil para:", userId);
+        }
+
+        // 2. Delete user's reviews (recursiveDelete removes the likes subcollection too)
+        const reviewsSnap = await db.collection("reviews").where("userId", "==", userId).get();
+        await Promise.all(reviewsSnap.docs.map(doc => db.recursiveDelete(doc.ref)));
+
+        // 3. Delete user's comments (recursiveDelete removes the likes subcollection too)
+        const commentsSnap = await db.collection("comments").where("userId", "==", userId).get();
+        await Promise.all(commentsSnap.docs.map(doc => db.recursiveDelete(doc.ref)));
+
+        // 4. Clean up follower/following relationships in other users' documents
+        const [followersSnap, followingSnap] = await Promise.all([
+            db.collection("users").doc(userId).collection("followers").get(),
+            db.collection("users").doc(userId).collection("following").get(),
+        ]);
+
+        const relationOps = [
+            ...followersSnap.docs.map(doc => ({ type: "follower", otherId: doc.id })),
+            ...followingSnap.docs.map(doc => ({ type: "following", otherId: doc.id })),
+        ];
+
+        for (let i = 0; i < relationOps.length; i += CHUNK) {
+            const batch = db.batch();
+            relationOps.slice(i, i + CHUNK).forEach(({ type, otherId }) => {
+                if (type === "follower") {
+                    batch.delete(db.collection("users").doc(otherId).collection("following").doc(userId));
+                    batch.update(db.collection("users").doc(otherId), { followingCount: FieldValue.increment(-1) });
+                } else {
+                    batch.delete(db.collection("users").doc(otherId).collection("followers").doc(userId));
+                    batch.update(db.collection("users").doc(otherId), { followersCount: FieldValue.increment(-1) });
+                }
+            });
+            await batch.commit();
+        }
+
+        // 5. Delete likes given by user on other people's content
+        // Like documents use userId as their document ID, so we can filter by doc.id
+        const allLikesSnap = await db.collectionGroup("likes").get();
+        const userLikeDocs = allLikesSnap.docs.filter(doc => doc.id === userId);
+
+        for (let i = 0; i < userLikeDocs.length; i += CHUNK) {
+            const batch = db.batch();
+            userLikeDocs.slice(i, i + CHUNK).forEach(doc => {
+                batch.delete(doc.ref);
+                batch.update(doc.ref.parent.parent, { likesCount: FieldValue.increment(-1) });
+            });
+            await batch.commit();
+        }
+
+        // 6. Delete user's subcollections (followers, following, notifications)
+        await Promise.all([
+            db.recursiveDelete(db.collection("users").doc(userId).collection("followers")),
+            db.recursiveDelete(db.collection("users").doc(userId).collection("following")),
+            db.recursiveDelete(db.collection("users").doc(userId).collection("notifications")),
+        ]);
+
+        logger.log("Limpieza completada para usuario:", userId);
     }
 );
