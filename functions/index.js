@@ -3,6 +3,7 @@ const {
     onDocumentCreated,
     onDocumentDeleted,
 } = require('firebase-functions/v2/firestore');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { getStorage } = require('firebase-admin/storage');
 
 const admin = require('firebase-admin');
@@ -42,6 +43,55 @@ async function sendPushAndSave(token, notification, data, recipientId, notifData
         logger.error("Error al enviar notificación FCM:", error);
     }
     await saveNotification(recipientId, notifData);
+}
+
+async function dispatchNotification(recipientId, userData, prefKey, notification, fcmData, notifData) {
+    const token = getFcmToken(userData);
+    if (checkPref(userData, prefKey) && token) {
+        await sendPushAndSave(token, notification, fcmData, recipientId, notifData);
+    } else {
+        await saveNotification(recipientId, notifData);
+    }
+}
+
+async function batchChunked(items, size, fn) {
+    for (let i = 0; i < items.length; i += size) {
+        const batch = db.batch();
+        items.slice(i, i + size).forEach(item => fn(batch, item));
+        await batch.commit();
+    }
+}
+
+const RECONCILE_BATCH = 20;
+
+async function reconcileOne(reviewDoc) {
+    const reviewId  = reviewDoc.id;
+    const reviewRef = db.collection("reviews").doc(reviewId);
+    const data      = reviewDoc.data();
+
+    const [likesCountSnap, commentsCountSnap] = await Promise.all([
+        reviewRef.collection("likes").count().get(),
+        db.collection("comments")
+            .where("reviewId", "==", reviewId)
+            .where("parentCommentId", "==", null)
+            .count()
+            .get(),
+    ]);
+
+    const actualLikes    = likesCountSnap.data().count;
+    const actualComments = commentsCountSnap.data().count;
+    const storedLikes    = data.likesCount ?? 0;
+    const storedComments = data.comment    ?? 0;
+
+    if (actualLikes === storedLikes && actualComments === storedComments) return false;
+
+    const update = {};
+    if (actualLikes    !== storedLikes)    update.likesCount = actualLikes;
+    if (actualComments !== storedComments) update.comment    = actualComments;
+
+    await reviewRef.update(update);
+    logger.log(`[reconcile] Fixed review ${reviewId}:`, update);
+    return true;
 }
 
 // --- Data sync functions ---
@@ -135,38 +185,19 @@ exports.onLikeCreated = onDocumentCreated(
 
         if (!authorSnap.exists) return;
 
-        const authorData = authorSnap.data();
         const likerUsername = likerSnap.data()?.username || "Alguien";
         const professorName = review.professor?.name || "un profesor";
 
-        const notifData = {
-            type: "like",
-            fromUserId: likerId,
-            fromUsername: likerUsername,
-            reviewId,
-            commentId: null,
-        };
-
-        if (!checkPref(authorData, "likes")) {
-            await saveNotification(authorId, notifData);
-            return;
-        }
-
-        const fcmToken = getFcmToken(authorData);
-        if (!fcmToken) {
-            await saveNotification(authorId, notifData);
-            return;
-        }
-
-        await sendPushAndSave(
-            fcmToken,
+        await dispatchNotification(
+            authorId,
+            authorSnap.data(),
+            "likes",
             {
                 title: "¡Le dieron like a tu reseña!",
                 body: `${likerUsername} le dio like a tu reseña de ${professorName}`,
             },
             { reviewId, type: "like" },
-            authorId,
-            notifData
+            { type: "like", fromUserId: likerId, fromUsername: likerUsername, reviewId, commentId: null }
         );
     }
 );
@@ -188,71 +219,41 @@ exports.onCommentCreated = onDocumentCreated(
         const reviewAuthorId = review.user?.userId || review.userId;
         const professorName = review.professor?.name || "un profesor";
 
-        // Notify review author when someone comments on their review
         if (reviewAuthorId && commenterId !== reviewAuthorId) {
             const authorSnap = await db.collection("users").doc(reviewAuthorId).get();
             if (authorSnap.exists) {
-                const authorData = authorSnap.data();
-                const notifData = {
-                    type: "comment",
-                    fromUserId: commenterId,
-                    fromUsername: commenterUsername,
-                    reviewId,
-                    commentId,
-                };
-                const fcmToken = getFcmToken(authorData);
-                if (checkPref(authorData, "comentarios") && fcmToken) {
-                    await sendPushAndSave(
-                        fcmToken,
-                        {
-                            title: "Nuevo comentario en tu reseña",
-                            body: `${commenterUsername} comentó en tu reseña de ${professorName}`,
-                        },
-                        { reviewId, commentId, type: "comment" },
-                        reviewAuthorId,
-                        notifData
-                    );
-                } else {
-                    await saveNotification(reviewAuthorId, notifData);
-                }
+                await dispatchNotification(
+                    reviewAuthorId,
+                    authorSnap.data(),
+                    "comentarios",
+                    {
+                        title: "Nuevo comentario en tu reseña",
+                        body: `${commenterUsername} comentó en tu reseña de ${professorName}`,
+                    },
+                    { reviewId, commentId, type: "comment" },
+                    { type: "comment", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId }
+                );
             }
         }
 
-        // Notify parent comment author when someone replies to their comment
         if (parentCommentId) {
             const parentSnap = await db.collection("comments").doc(parentCommentId).get();
             if (parentSnap.exists) {
                 const parentAuthorId = parentSnap.data()?.userId;
-                if (
-                    parentAuthorId &&
-                    parentAuthorId !== commenterId &&
-                    parentAuthorId !== reviewAuthorId
-                ) {
+                if (parentAuthorId && parentAuthorId !== commenterId && parentAuthorId !== reviewAuthorId) {
                     const parentAuthorSnap = await db.collection("users").doc(parentAuthorId).get();
                     if (parentAuthorSnap.exists) {
-                        const parentAuthorData = parentAuthorSnap.data();
-                        const notifData = {
-                            type: "reply",
-                            fromUserId: commenterId,
-                            fromUsername: commenterUsername,
-                            reviewId,
-                            commentId,
-                        };
-                        const fcmToken = getFcmToken(parentAuthorData);
-                        if (checkPref(parentAuthorData, "comentarios") && fcmToken) {
-                            await sendPushAndSave(
-                                fcmToken,
-                                {
-                                    title: "Respondieron tu comentario",
-                                    body: `${commenterUsername} respondió tu comentario`,
-                                },
-                                { reviewId, commentId, type: "reply" },
-                                parentAuthorId,
-                                notifData
-                            );
-                        } else {
-                            await saveNotification(parentAuthorId, notifData);
-                        }
+                        await dispatchNotification(
+                            parentAuthorId,
+                            parentAuthorSnap.data(),
+                            "comentarios",
+                            {
+                                title: "Respondieron tu comentario",
+                                body: `${commenterUsername} respondió tu comentario`,
+                            },
+                            { reviewId, commentId, type: "reply" },
+                            { type: "reply", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId }
+                        );
                     }
                 }
             }
@@ -263,8 +264,8 @@ exports.onCommentCreated = onDocumentCreated(
 exports.onFollowCreated = onDocumentCreated(
     "users/{userId}/followers/{followerId}",
     async (event) => {
-        const userId = event.params.userId;       // recipient (followed)
-        const followerId = event.params.followerId; // sender (follower)
+        const userId = event.params.userId;
+        const followerId = event.params.followerId;
 
         const [recipientSnap, followerSnap] = await Promise.all([
             db.collection("users").doc(userId).get(),
@@ -273,37 +274,18 @@ exports.onFollowCreated = onDocumentCreated(
 
         if (!recipientSnap.exists) return;
 
-        const recipientData = recipientSnap.data();
         const followerUsername = followerSnap.data()?.username || "Alguien";
 
-        const notifData = {
-            type: "follow",
-            fromUserId: followerId,
-            fromUsername: followerUsername,
-            reviewId: null,
-            commentId: null,
-        };
-
-        if (!checkPref(recipientData, "seguidores")) {
-            await saveNotification(userId, notifData);
-            return;
-        }
-
-        const fcmToken = getFcmToken(recipientData);
-        if (!fcmToken) {
-            await saveNotification(userId, notifData);
-            return;
-        }
-
-        await sendPushAndSave(
-            fcmToken,
+        await dispatchNotification(
+            userId,
+            recipientSnap.data(),
+            "seguidores",
             {
                 title: "¡Tienes un nuevo seguidor!",
                 body: `${followerUsername} empezó a seguirte`,
             },
             { followerId, type: "follow" },
-            userId,
-            notifData
+            { type: "follow", fromUserId: followerId, fromUsername: followerUsername, reviewId: null, commentId: null }
         );
     }
 );
@@ -316,35 +298,47 @@ exports.onUserAccountDeleted = onDocumentDeleted(
 
         logger.log("Iniciando limpieza de cuenta:", userId);
 
-        // 1. Delete profile image from Storage
-        try {
-            await getStorage().bucket().file(`profileImages/${userId}.jpg`).delete();
-        } catch (e) {
-            logger.warn("Sin imagen de perfil para:", userId);
-        }
+        const storageDelete = getStorage().bucket()
+            .file(`profileImages/${userId}.jpg`)
+            .delete()
+            .catch(() => logger.warn("Sin imagen de perfil para:", userId));
 
-        // 2. Delete user's reviews (recursiveDelete removes the likes subcollection too)
-        const reviewsSnap = await db.collection("reviews").where("userId", "==", userId).get();
-        await Promise.all(reviewsSnap.docs.map(doc => db.recursiveDelete(doc.ref)));
-
-        // 3. Delete user's comments (recursiveDelete removes the likes subcollection too)
-        const commentsSnap = await db.collection("comments").where("userId", "==", userId).get();
-        await Promise.all(commentsSnap.docs.map(doc => db.recursiveDelete(doc.ref)));
-
-        // 4. Clean up follower/following relationships in other users' documents
-        const [followersSnap, followingSnap] = await Promise.all([
+        const [reviewsSnap, commentsSnap, followersSnap, followingSnap, allLikesSnap] = await Promise.all([
+            db.collection("reviews").where("userId", "==", userId).get(),
+            db.collection("comments").where("userId", "==", userId).get(),
             db.collection("users").doc(userId).collection("followers").get(),
             db.collection("users").doc(userId).collection("following").get(),
+            db.collectionGroup("likes").get(),
         ]);
+
+        const userReviewIds = new Set(reviewsSnap.docs.map(d => d.id));
+        const userCommentIds = new Set(commentsSnap.docs.map(d => d.id));
+        // like documents use the userId as their document ID (no queryable userId field)
+        const userLikeDocs = allLikesSnap.docs.filter(doc => doc.id === userId);
 
         const relationOps = [
             ...followersSnap.docs.map(doc => ({ type: "follower", otherId: doc.id })),
             ...followingSnap.docs.map(doc => ({ type: "following", otherId: doc.id })),
         ];
 
-        for (let i = 0; i < relationOps.length; i += CHUNK) {
-            const batch = db.batch();
-            relationOps.slice(i, i + CHUNK).forEach(({ type, otherId }) => {
+        await Promise.all([
+            storageDelete,
+
+            Promise.all(reviewsSnap.docs.map(doc => db.recursiveDelete(doc.ref))),
+
+            (async () => {
+                if (commentsSnap.empty) return;
+                await batchChunked(commentsSnap.docs, CHUNK, (batch, doc) => {
+                    const data = doc.data();
+                    if (data.reviewId && !userReviewIds.has(data.reviewId))
+                        batch.update(db.collection("reviews").doc(data.reviewId), { comment: FieldValue.increment(-1) });
+                    if (data.parentCommentId && !userCommentIds.has(data.parentCommentId))
+                        batch.update(db.collection("comments").doc(data.parentCommentId), { repliesCount: FieldValue.increment(-1) });
+                });
+                await Promise.all(commentsSnap.docs.map(doc => db.recursiveDelete(doc.ref)));
+            })(),
+
+            batchChunked(relationOps, CHUNK, (batch, { type, otherId }) => {
                 if (type === "follower") {
                     batch.delete(db.collection("users").doc(otherId).collection("following").doc(userId));
                     batch.update(db.collection("users").doc(otherId), { followingCount: FieldValue.increment(-1) });
@@ -352,31 +346,203 @@ exports.onUserAccountDeleted = onDocumentDeleted(
                     batch.delete(db.collection("users").doc(otherId).collection("followers").doc(userId));
                     batch.update(db.collection("users").doc(otherId), { followersCount: FieldValue.increment(-1) });
                 }
-            });
-            await batch.commit();
-        }
+            }),
 
-        // 5. Delete likes given by user on other people's content
-        // Like documents use userId as their document ID, so we can filter by doc.id
-        const allLikesSnap = await db.collectionGroup("likes").get();
-        const userLikeDocs = allLikesSnap.docs.filter(doc => doc.id === userId);
-
-        for (let i = 0; i < userLikeDocs.length; i += CHUNK) {
-            const batch = db.batch();
-            userLikeDocs.slice(i, i + CHUNK).forEach(doc => {
+            batchChunked(userLikeDocs, CHUNK, (batch, doc) => {
                 batch.delete(doc.ref);
                 batch.update(doc.ref.parent.parent, { likesCount: FieldValue.increment(-1) });
-            });
-            await batch.commit();
-        }
+            }),
 
-        // 6. Delete user's subcollections (followers, following, notifications)
-        await Promise.all([
-            db.recursiveDelete(db.collection("users").doc(userId).collection("followers")),
-            db.recursiveDelete(db.collection("users").doc(userId).collection("following")),
-            db.recursiveDelete(db.collection("users").doc(userId).collection("notifications")),
+            Promise.all([
+                db.recursiveDelete(db.collection("users").doc(userId).collection("followers")),
+                db.recursiveDelete(db.collection("users").doc(userId).collection("following")),
+                db.recursiveDelete(db.collection("users").doc(userId).collection("notifications")),
+            ]),
         ]);
 
         logger.log("Limpieza completada para usuario:", userId);
+    }
+);
+
+exports.reconcileReviewCounters = onSchedule(
+    {
+        schedule: "every 24 hours",
+        timeZone: "America/Bogota",
+        timeoutSeconds: 540,
+        memory: "512MiB",
+        retryCount: 0,
+    },
+    async (_event) => {
+        const reviewsSnap = await db.collection("reviews")
+            .select("likesCount", "comment")
+            .get();
+        const reviewDocs = reviewsSnap.docs;
+        logger.log(`[reconcileReviewCounters] Checking ${reviewDocs.length} reviews`);
+
+        let fixed = 0;
+        for (let i = 0; i < reviewDocs.length; i += RECONCILE_BATCH) {
+            const results = await Promise.all(
+                reviewDocs.slice(i, i + RECONCILE_BATCH).map(reconcileOne)
+            );
+            fixed += results.filter(Boolean).length;
+        }
+        logger.log(`[reconcileReviewCounters] Done. Fixed: ${fixed}/${reviewDocs.length}`);
+    }
+);
+
+// Aggregates counter decrements per parent document to avoid duplicate-doc-in-batch errors.
+// skip(doc, ref) → true means skip this doc from the aggregation.
+function aggregateDecrements(docs, getRef, skip) {
+    const map = new Map();
+    for (const doc of docs) {
+        const ref = getRef(doc);
+        if (skip && skip(doc, ref)) continue;
+        const p = ref.path;
+        if (!map.has(p)) map.set(p, { ref, n: 0 });
+        map.get(p).n++;
+    }
+    return [...map.values()];
+}
+
+exports.cleanupOrphanedData = onSchedule(
+    {
+        schedule: "every 24 hours",
+        timeZone: "America/Bogota",
+        timeoutSeconds: 540,
+        memory: "512MiB",
+        retryCount: 0,
+    },
+    async (_event) => {
+        // Phase 1: Load all data needed for orphan detection
+        const [usersSnap, reviewsSnap, commentsSnap, allLikesSnap, allFollowersSnap, allFollowingSnap] =
+            await Promise.all([
+                db.collection("users").get(),
+                db.collection("reviews").select("userId").get(),
+                db.collection("comments").select("userId", "reviewId", "parentCommentId").get(),
+                db.collectionGroup("likes").get(),
+                db.collectionGroup("followers").get(),
+                db.collectionGroup("following").get(),
+            ]);
+
+        const validIds = new Set(usersSnap.docs.map(d => d.id));
+
+        // Phase 2: Find orphaned documents
+        // For likes/followers/following the doc.id IS the referenced userId
+        const orphanedReviews   = reviewsSnap.docs.filter(d => !validIds.has(d.data().userId));
+        const orphanedComments  = commentsSnap.docs.filter(d => !validIds.has(d.data().userId));
+        const orphanedLikes     = allLikesSnap.docs.filter(d => !validIds.has(d.id));
+        // Also orphaned if the parent user no longer exists
+        const orphanedFollowers = allFollowersSnap.docs.filter(d =>
+            !validIds.has(d.id) || !validIds.has(d.ref.parent.parent.id)
+        );
+        const orphanedFollowing = allFollowingSnap.docs.filter(d =>
+            !validIds.has(d.id) || !validIds.has(d.ref.parent.parent.id)
+        );
+
+        const total = orphanedReviews.length + orphanedComments.length + orphanedLikes.length +
+                      orphanedFollowers.length + orphanedFollowing.length;
+
+        logger.log(`[cleanupOrphanedData] reviews:${orphanedReviews.length} comments:${orphanedComments.length} likes:${orphanedLikes.length} followers:${orphanedFollowers.length} following:${orphanedFollowing.length}`);
+        if (total === 0) return;
+
+        const orphanedReviewIds  = new Set(orphanedReviews.map(d => d.id));
+        const orphanedCommentIds = new Set(orphanedComments.map(d => d.id));
+
+        // Phase 3: Aggregate counter decrements per parent doc (avoids duplicate writes in same batch)
+        const commentDecrs = aggregateDecrements(
+            orphanedComments,
+            doc => db.collection("reviews").doc(doc.data().reviewId),
+            doc => !doc.data().reviewId || orphanedReviewIds.has(doc.data().reviewId)
+        );
+        const replyDecrs = aggregateDecrements(
+            orphanedComments,
+            doc => db.collection("comments").doc(doc.data().parentCommentId),
+            doc => !doc.data().parentCommentId || orphanedCommentIds.has(doc.data().parentCommentId)
+        );
+        const likeDecrs = aggregateDecrements(
+            orphanedLikes,
+            doc => doc.ref.parent.parent,
+            (doc, ref) => ref.parent.id === "reviews"
+                ? orphanedReviewIds.has(ref.id)
+                : orphanedCommentIds.has(ref.id)
+        );
+        // Only decrement if the parent user still exists
+        const followerDecrs = aggregateDecrements(
+            orphanedFollowers,
+            doc => doc.ref.parent.parent,
+            (doc, ref) => !validIds.has(ref.id)
+        );
+        const followingDecrs = aggregateDecrements(
+            orphanedFollowing,
+            doc => doc.ref.parent.parent,
+            (doc, ref) => !validIds.has(ref.id)
+        );
+
+        // Phase 4: Delete orphans and update counters in parallel
+        await Promise.all([
+            Promise.all(orphanedReviews.map(doc => db.recursiveDelete(doc.ref))),
+            Promise.all(orphanedComments.map(doc => db.recursiveDelete(doc.ref))),
+            batchChunked(orphanedLikes,     500, (batch, doc) => batch.delete(doc.ref)),
+            batchChunked(orphanedFollowers, 500, (batch, doc) => batch.delete(doc.ref)),
+            batchChunked(orphanedFollowing, 500, (batch, doc) => batch.delete(doc.ref)),
+            batchChunked(commentDecrs,   500, (batch, { ref, n }) => batch.update(ref, { comment:        FieldValue.increment(-n) })),
+            batchChunked(replyDecrs,     500, (batch, { ref, n }) => batch.update(ref, { repliesCount:   FieldValue.increment(-n) })),
+            batchChunked(likeDecrs,      500, (batch, { ref, n }) => batch.update(ref, { likesCount:     FieldValue.increment(-n) })),
+            batchChunked(followerDecrs,  500, (batch, { ref, n }) => batch.update(ref, { followersCount: FieldValue.increment(-n) })),
+            batchChunked(followingDecrs, 500, (batch, { ref, n }) => batch.update(ref, { followingCount: FieldValue.increment(-n) })),
+        ]);
+
+        logger.log("[cleanupOrphanedData] Cleanup complete.");
+    }
+);
+
+exports.reconcileMateriaInReviews = onSchedule(
+    {
+        schedule: "every 24 hours",
+        timeZone: "America/Bogota",
+        timeoutSeconds: 540,
+        memory: "256MiB",
+        retryCount: 0,
+    },
+    async (_event) => {
+        const [professorsSnap, reviewsSnap] = await Promise.all([
+            db.collection("professors").select("subjects").get(),
+            db.collection("reviews").select("professorId", "materia").get(),
+        ]);
+
+        const profSubjects = new Map();
+        for (const doc of professorsSnap.docs) {
+            profSubjects.set(doc.id, new Set(doc.data().subjects || []));
+        }
+
+        const invalidReviews = reviewsSnap.docs.filter(doc => {
+            const { professorId, materia } = doc.data();
+            if (!professorId || !materia) return true;
+            const subjects = profSubjects.get(professorId);
+            if (!subjects) return false;
+            return !subjects.has(materia);
+        });
+
+        logger.log(`[reconcileMateriaInReviews] Invalid: ${invalidReviews.length}/${reviewsSnap.size}`);
+        if (!invalidReviews.length) return;
+
+        const invalidReviewIds = invalidReviews.map(d => d.id);
+
+        // Fetch all comments on invalid reviews (in parallel chunks of 30)
+        const commentSnaps = await Promise.all(
+            Array.from({ length: Math.ceil(invalidReviewIds.length / 30) }, (_, i) =>
+                db.collection("comments")
+                    .where("reviewId", "in", invalidReviewIds.slice(i * 30, i * 30 + 30))
+                    .get()
+            )
+        );
+        const commentDocs = commentSnaps.flatMap(s => s.docs);
+
+        // recursiveDelete handles likes subcollections on both reviews and comments
+        await Promise.all([
+            Promise.all(invalidReviews.map(doc => db.recursiveDelete(doc.ref))),
+            Promise.all(commentDocs.map(doc => db.recursiveDelete(doc.ref))),
+        ]);
+        logger.log(`[reconcileMateriaInReviews] Deleted ${invalidReviews.length} reviews and ${commentDocs.length} comments.`);
     }
 );
