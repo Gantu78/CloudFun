@@ -596,6 +596,97 @@ exports.cleanupUnverifiedUsers = onSchedule(
     }
 );
 
+exports.onBlockCreated = onDocumentCreated(
+    "blocks/{blockId}",
+    async (event) => {
+        const { blockerId, blockedId } = event.data.data();
+        if (!blockerId || !blockedId) return;
+
+        const blockerRef = db.collection("users").doc(blockerId);
+        const blockedRef = db.collection("users").doc(blockedId);
+
+        // Check both follow directions in parallel
+        const [aFollowsB, bFollowsA] = await Promise.all([
+            blockerRef.collection("following").doc(blockedId).get(),
+            blockedRef.collection("following").doc(blockerId).get(),
+        ]);
+
+        if (!aFollowsB.exists && !bFollowsA.exists) return;
+
+        const batch = db.batch();
+
+        if (aFollowsB.exists) {
+            batch.delete(blockerRef.collection("following").doc(blockedId));
+            batch.delete(blockedRef.collection("followers").doc(blockerId));
+            batch.update(blockerRef, { followingCount: FieldValue.increment(-1) });
+            batch.update(blockedRef, { followersCount: FieldValue.increment(-1) });
+        }
+
+        if (bFollowsA.exists) {
+            batch.delete(blockedRef.collection("following").doc(blockerId));
+            batch.delete(blockerRef.collection("followers").doc(blockedId));
+            batch.update(blockedRef, { followingCount: FieldValue.increment(-1) });
+            batch.update(blockerRef, { followersCount: FieldValue.increment(-1) });
+        }
+
+        await batch.commit();
+        logger.log(`[onBlockCreated] Removed follow(s) between ${blockerId} and ${blockedId}`);
+    }
+);
+
+exports.onReportCreated = onDocumentCreated(
+    "reports/{reportId}",
+    async (event) => {
+        const report = event.data.data();
+        const { targetId, targetType } = report;
+
+        if (targetType !== "review") return;
+
+        const countSnap = await db.collection("reports")
+            .where("targetId", "==", targetId)
+            .where("targetType", "==", "review")
+            .count()
+            .get();
+
+        if (countSnap.data().count < 5) return;
+
+        const reviewRef = db.collection("reviews").doc(targetId);
+        const reviewSnap = await reviewRef.get();
+        if (!reviewSnap.exists) return;
+
+        const review = reviewSnap.data();
+        const authorId = review.user?.userId || review.userId;
+        const professorName = review.professor?.name || "un profesor";
+
+        const commentsSnap = await db.collection("comments")
+            .where("reviewId", "==", targetId)
+            .get();
+
+        await Promise.all([
+            db.recursiveDelete(reviewRef),
+            ...commentsSnap.docs.map(doc => db.recursiveDelete(doc.ref)),
+        ]);
+
+        logger.log(`[onReportCreated] Deleted review ${targetId} (5+ reports)`);
+
+        if (!authorId) return;
+        const authorSnap = await db.collection("users").doc(authorId).get();
+        if (!authorSnap.exists) return;
+
+        await dispatchNotification(
+            authorId,
+            authorSnap.data(),
+            "reportes",
+            {
+                title: "Tu reseña fue eliminada",
+                body: `Tu reseña de ${professorName} fue eliminada por violar las normas de la comunidad.`,
+            },
+            { type: "reviewDeleted" },
+            { type: "reviewDeleted", reviewId: targetId, fromUserId: null, fromUsername: null, commentId: null }
+        );
+    }
+);
+
 exports.confirmAccountDeletion = onRequest(
     { region: 'us-central1', cors: WEB_ORIGIN },
     async (req, res) => {
