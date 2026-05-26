@@ -4,7 +4,10 @@ const {
     onDocumentDeleted,
 } = require('firebase-functions/v2/firestore');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
+const { onRequest } = require('firebase-functions/v2/https');
 const { getStorage } = require('firebase-admin/storage');
+
+const WEB_ORIGIN = 'https://tuprofe-89d43.web.app';
 
 const admin = require('firebase-admin');
 const logger = require('firebase-functions/logger');
@@ -544,5 +547,87 @@ exports.reconcileMateriaInReviews = onSchedule(
             Promise.all(commentDocs.map(doc => db.recursiveDelete(doc.ref))),
         ]);
         logger.log(`[reconcileMateriaInReviews] Deleted ${invalidReviews.length} reviews and ${commentDocs.length} comments.`);
+    }
+);
+
+exports.cleanupUnverifiedUsers = onSchedule(
+    {
+        schedule: "every 24 hours",
+        timeZone: "America/Bogota",
+        timeoutSeconds: 540,
+        memory: "256MiB",
+        retryCount: 0,
+    },
+    async (_event) => {
+        // Paginate through all Firebase Auth users and collect unverified UIDs
+        const unverifiedUids = [];
+        let pageToken;
+        do {
+            const result = await admin.auth().listUsers(1000, pageToken);
+            const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+            for (const user of result.users) {
+                if (!user.emailVerified && new Date(user.metadata.creationTime).getTime() < cutoff)
+                    unverifiedUids.push(user.uid);
+            }
+            pageToken = result.pageToken;
+        } while (pageToken);
+
+        logger.log(`[cleanupUnverifiedUsers] Found ${unverifiedUids.length} unverified users`);
+        if (!unverifiedUids.length) return;
+
+        await Promise.all([
+            // Deleting the Firestore doc triggers onUserAccountDeleted for full data cleanup
+            batchChunked(unverifiedUids, 500, (batch, uid) =>
+                batch.delete(db.collection("users").doc(uid))
+            ),
+            // Delete Auth accounts in chunks of 1000 (max per deleteUsers call)
+            (async () => {
+                for (let i = 0; i < unverifiedUids.length; i += 1000) {
+                    const { failureCount, errors } = await admin.auth().deleteUsers(
+                        unverifiedUids.slice(i, i + 1000)
+                    );
+                    if (failureCount > 0)
+                        errors.forEach(e => logger.error("[cleanupUnverifiedUsers] Auth error:", e.error));
+                }
+            })(),
+        ]);
+
+        logger.log(`[cleanupUnverifiedUsers] Deleted ${unverifiedUids.length} unverified users`);
+    }
+);
+
+exports.confirmAccountDeletion = onRequest(
+    { region: 'us-central1', cors: WEB_ORIGIN },
+    async (req, res) => {
+        if (req.method !== 'POST') {
+            return res.status(405).json({ error: 'Method not allowed' });
+        }
+
+        const authHeader = req.headers.authorization || '';
+        const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (!idToken) return res.status(401).json({ error: 'Unauthorized' });
+
+        const { username } = req.body;
+
+        try {
+            const decoded = await admin.auth().verifyIdToken(idToken);
+            const uid = decoded.uid;
+
+            if (username) {
+                const userDoc = await db.collection('users').doc(uid).get();
+                if (!userDoc.exists || userDoc.data().username !== username) {
+                    return res.status(403).json({ error: 'Username mismatch' });
+                }
+            }
+
+            await db.collection('users').doc(uid).delete();
+            await admin.auth().deleteUser(uid);
+
+            logger.log('Account deleted via email link for uid:', uid);
+            return res.status(200).json({ success: true });
+        } catch (err) {
+            logger.error('confirmAccountDeletion error:', err);
+            return res.status(500).json({ error: 'Internal server error' });
+        }
     }
 );
