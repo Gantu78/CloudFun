@@ -7,7 +7,7 @@ const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { onRequest } = require('firebase-functions/v2/https');
 const { getStorage } = require('firebase-admin/storage');
 
-const WEB_ORIGIN = 'https://tuprofe-89d43.web.app';
+const WEB_ORIGIN = ['https://www.tuprofeappmovil.com', 'https://tuprofe-89d43.web.app'];
 
 const admin = require('firebase-admin');
 const logger = require('firebase-functions/logger');

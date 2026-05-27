@@ -72,4 +72,7 @@ node_modules/
 CLAUDE.md
 .claude/settings.json
 
+# macOS
+.DS_Store
+
 
