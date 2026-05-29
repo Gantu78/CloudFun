@@ -50,10 +50,11 @@ async function sendPushAndSave(token, notification, data, recipientId, notifData
 
 async function dispatchNotification(recipientId, userData, prefKey, notification, fcmData, notifData) {
     const token = getFcmToken(userData);
+    const fullNotifData = { ...notifData, title: notification.title, body: notification.body };
     if (checkPref(userData, prefKey) && token) {
-        await sendPushAndSave(token, notification, fcmData, recipientId, notifData);
+        await sendPushAndSave(token, notification, fcmData, recipientId, fullNotifData);
     } else {
-        await saveNotification(recipientId, notifData);
+        await saveNotification(recipientId, fullNotifData);
     }
 }
 
