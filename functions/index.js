@@ -38,9 +38,37 @@ async function saveNotification(recipientId, notifData) {
         });
 }
 
+function buildLocMessage(token, notification, data, titleLocKey, titleLocArgs) {
+    return {
+        token,
+        notification,
+        data,
+        android: {
+            notification: {
+                titleLocKey,
+                ...(titleLocArgs && { titleLocArgs }),
+            },
+        },
+        apns: {
+            payload: {
+                aps: {
+                    alert: {
+                        titleLocKey,
+                        ...(titleLocArgs && { titleLocArgs }),
+                    },
+                },
+            },
+        },
+    };
+}
+
 async function sendPushAndSave(token, notification, data, recipientId, notifData) {
+    const { titleLocKey, titleLocArgs } = notifData;
+    const message = titleLocKey
+        ? buildLocMessage(token, notification, data, titleLocKey, titleLocArgs)
+        : { token, notification, data };
     try {
-        await admin.messaging().send({ token, notification, data });
+        await admin.messaging().send(message);
         logger.log("Notificación enviada a:", recipientId);
     } catch (error) {
         logger.error("Error al enviar notificación FCM:", error);
@@ -201,7 +229,7 @@ exports.onLikeCreated = onDocumentCreated(
                 body: `${likerUsername} le dio like a tu reseña de ${professorName}`,
             },
             { reviewId, type: "like" },
-            { type: "like", fromUserId: likerId, fromUsername: likerUsername, reviewId, commentId: null }
+            { type: "like", fromUserId: likerId, fromUsername: likerUsername, reviewId, commentId: null, titleLocKey: "notif_like_title", titleLocArgs: [likerUsername] }
         );
     }
 );
@@ -235,7 +263,7 @@ exports.onCommentCreated = onDocumentCreated(
                         body: `${commenterUsername} comentó en tu reseña de ${professorName}`,
                     },
                     { reviewId, commentId, type: "comment" },
-                    { type: "comment", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId }
+                    { type: "comment", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId, titleLocKey: "notif_comment_title", titleLocArgs: [commenterUsername] }
                 );
             }
         }
@@ -256,7 +284,7 @@ exports.onCommentCreated = onDocumentCreated(
                                 body: `${commenterUsername} respondió tu comentario`,
                             },
                             { reviewId, commentId, type: "reply" },
-                            { type: "reply", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId }
+                            { type: "reply", fromUserId: commenterId, fromUsername: commenterUsername, reviewId, commentId, titleLocKey: "notif_reply_title", titleLocArgs: [commenterUsername] }
                         );
                     }
                 }
@@ -289,7 +317,7 @@ exports.onFollowCreated = onDocumentCreated(
                 body: `${followerUsername} empezó a seguirte`,
             },
             { followerId, type: "follow" },
-            { type: "follow", fromUserId: followerId, fromUsername: followerUsername, reviewId: null, commentId: null }
+            { type: "follow", fromUserId: followerId, fromUsername: followerUsername, reviewId: null, commentId: null, titleLocKey: "notif_follow_title", titleLocArgs: [followerUsername] }
         );
     }
 );
@@ -683,7 +711,7 @@ exports.onReportCreated = onDocumentCreated(
                 body: `Tu reseña de ${professorName} fue eliminada por violar las normas de la comunidad.`,
             },
             { type: "reviewDeleted" },
-            { type: "reviewDeleted", reviewId: targetId, fromUserId: null, fromUsername: null, commentId: null }
+            { type: "reviewDeleted", reviewId: targetId, fromUserId: null, fromUsername: null, commentId: null, titleLocKey: "notif_review_deleted_title", titleLocArgs: null }
         );
     }
 );
