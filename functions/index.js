@@ -164,31 +164,57 @@ exports.updateProfessorInfoInReviews = onDocumentUpdated(
         const before = event.data.before.data();
         const after = event.data.after.data();
 
-        const changed =
+        const infoChanged =
             before.name !== after.name ||
             before.foto_prof !== after.foto_prof ||
             before.department !== after.department;
 
-        if (!changed) return;
+        const beforeSubjects = before.subjects || [];
+        const afterSubjects  = after.subjects  || [];
+        const afterSet       = new Set(afterSubjects);
+        const beforeSet      = new Set(beforeSubjects);
+        const removed        = beforeSubjects.filter(s => !afterSet.has(s));
+        const added          = afterSubjects.filter(s => !beforeSet.has(s));
+        // Only handle unambiguous 1-to-1 renames
+        const subjectsRenamed = removed.length === 1 && added.length === 1;
 
-        const reviewsSnapshot = await db
-            .collection("reviews")
-            .where("professorId", "==", professorId)
-            .get();
+        if (!infoChanged && !subjectsRenamed) return;
 
-        if (reviewsSnapshot.empty) return;
+        const tasks = [];
 
-        const batch = db.batch();
-        reviewsSnapshot.forEach((doc) => {
-            batch.update(doc.ref, {
-                "professor.name": after.name,
-                "professor.foto_prof": after.foto_prof,
-                "professor.department": after.department,
-            });
-        });
+        if (infoChanged) {
+            tasks.push((async () => {
+                const snap = await db.collection("reviews")
+                    .where("professorId", "==", professorId)
+                    .get();
+                if (snap.empty) return;
+                const batch = db.batch();
+                snap.forEach(doc => batch.update(doc.ref, {
+                    "professor.name":       after.name,
+                    "professor.foto_prof":  after.foto_prof,
+                    "professor.department": after.department,
+                }));
+                await batch.commit();
+                logger.log("Reviews actualizadas (info) para profesor:", professorId);
+            })());
+        }
 
-        await batch.commit();
-        logger.log("Reviews actualizadas para profesor:", professorId);
+        if (subjectsRenamed) {
+            const [oldName, newName] = [removed[0], added[0]];
+            tasks.push((async () => {
+                const snap = await db.collection("reviews")
+                    .where("professorId", "==", professorId)
+                    .where("materia", "==", oldName)
+                    .get();
+                if (snap.empty) return;
+                const batch = db.batch();
+                snap.forEach(doc => batch.update(doc.ref, { materia: newName }));
+                await batch.commit();
+                logger.log(`[materias] "${oldName}" → "${newName}" en ${snap.size} reseñas del profesor ${professorId}`);
+            })());
+        }
+
+        await Promise.all(tasks);
     }
 );
 
