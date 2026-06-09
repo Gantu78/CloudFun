@@ -6,6 +6,9 @@ const {
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { onRequest } = require('firebase-functions/v2/https');
 const { getStorage } = require('firebase-admin/storage');
+const { defineSecret } = require('firebase-functions/params');
+
+const groqApiKey = defineSecret('GROQ_API_KEY');
 
 const WEB_ORIGIN = ['https://www.tuprofeappmovil.com', 'https://tuprofe-89d43.web.app'];
 
@@ -739,6 +742,66 @@ exports.onReportCreated = onDocumentCreated(
             { type: "reviewDeleted" },
             { type: "reviewDeleted", reviewId: targetId, fromUserId: null, fromUsername: null, commentId: null, titleLocKey: "notif_review_deleted_title", titleLocArgs: null }
         );
+    }
+);
+
+exports.generateReviewSummary = onRequest(
+    { region: 'us-central1', cors: false, secrets: [groqApiKey] },
+    async (req, res) => {
+        if (req.method !== 'POST') {
+            return res.status(405).json({ error: 'Method not allowed' });
+        }
+
+        const authHeader = req.headers.authorization || '';
+        const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (!idToken) return res.status(401).json({ error: 'Unauthorized' });
+
+        try {
+            await admin.auth().verifyIdToken(idToken);
+        } catch {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+
+        const { reviews } = req.body;
+        if (!Array.isArray(reviews) || reviews.length === 0) {
+            return res.status(400).json({ error: 'Invalid reviews' });
+        }
+
+        const reviewsText = reviews.slice(0, 20).map(r => `- ${r}`).join('\n');
+
+        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${groqApiKey.value()}`,
+            },
+            body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'Eres un asistente experto en analizar reseñas de profesores. Resume los puntos clave (lo bueno y lo malo) de forma muy concisa y objetiva en español. Usa un tono profesional.',
+                    },
+                    {
+                        role: 'user',
+                        content: `Basado en estas reseñas de alumnos, genera un resumen corto:\n\n${reviewsText}`,
+                    },
+                ],
+                max_tokens: 300,
+                temperature: 0.7,
+            }),
+        });
+
+        if (!groqRes.ok) {
+            logger.error('[generateReviewSummary] Groq error:', groqRes.status);
+            return res.status(502).json({ error: 'AI service error' });
+        }
+
+        const data = await groqRes.json();
+        const summary = data?.choices?.[0]?.message?.content?.trim();
+        if (!summary) return res.status(502).json({ error: 'Empty response from AI' });
+
+        return res.status(200).json({ summary });
     }
 );
 
